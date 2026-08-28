@@ -1,14 +1,18 @@
+```bash
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # shellcheck source=jenkins_common.sh
 source "${SCRIPT_DIR}/jenkins_common.sh"
 
 JENKINS_URL="${JENKINS_URL:-http://127.0.0.1:8080}"
 JENKINS_REPO_CHANNEL="${JENKINS_REPO_CHANNEL:-stable}"
+
 JAVA_PACKAGE_RHEL="${JAVA_PACKAGE_RHEL:-java-21-openjdk}"
 JAVA_PACKAGE_DEBIAN="${JAVA_PACKAGE_DEBIAN:-openjdk-21-jre}"
+
 INSTALL_GIT="${INSTALL_GIT:-true}"
 RUN_INITIAL_SETUP="${RUN_INITIAL_SETUP:-true}"
 INSTALL_PLUGINS="${INSTALL_PLUGINS:-true}"
@@ -22,91 +26,228 @@ as_root() {
   fi
 }
 
-install_rhel_family() {
-  local pm
-  if command -v dnf >/dev/null 2>&1; then pm=dnf; else pm=yum; fi
+apt_update() {
+  local attempt
 
-  as_root "$pm" -y install ca-certificates curl wget fontconfig "$JAVA_PACKAGE_RHEL"
-  [[ "$INSTALL_GIT" == true ]] && as_root "$pm" -y install git
+  for attempt in 1 2 3; do
+    log "Running apt-get update (attempt ${attempt}/3)"
 
-  local repo_base
-  if [[ "$JENKINS_REPO_CHANNEL" == "stable" ]]; then repo_base="redhat-stable"; else repo_base="redhat"; fi
+    if as_root apt-get update; then
+      return 0
+    fi
 
-  as_root wget -q -O /etc/yum.repos.d/jenkins.repo \
-    "https://pkg.jenkins.io/${repo_base}/jenkins.repo"
-  as_root rpm --import "https://pkg.jenkins.io/${repo_base}/jenkins.io-2023.key"
-  as_root "$pm" -y install jenkins
+    log "apt-get update failed, cleaning APT metadata"
+
+    as_root apt-get clean || true
+    as_root rm -rf /var/lib/apt/lists/*
+    as_root mkdir -p /var/lib/apt/lists/partial
+
+    sleep 5
+  done
+
+  log "=== APT diagnostics ==="
+  as_root sh -c 'cat /etc/apt/sources.list 2>/dev/null || true'
+  as_root sh -c 'find /etc/apt/sources.list.d -maxdepth 1 -type f -exec sh -c '\''echo "--- $1"; cat "$1"'\'' _ {} \; 2>/dev/null || true'
+  df -h || true
+  df -i || true
+
+  fail "apt-get update failed after 3 attempts"
 }
 
 install_debian_family() {
-  as_root apt-get update
-  as_root apt-get install -y ca-certificates curl wget fontconfig gnupg "$JAVA_PACKAGE_DEBIAN"
-  [[ "$INSTALL_GIT" == true ]] && as_root apt-get install -y git
+  export DEBIAN_FRONTEND=noninteractive
+
+  log "Cleaning existing APT metadata"
+  as_root apt-get clean || true
+  as_root rm -rf /var/lib/apt/lists/*
+  as_root mkdir -p /var/lib/apt/lists/partial
+
+  apt_update
+
+  log "Installing base dependencies"
+  as_root apt-get install -y \
+    ca-certificates \
+    curl \
+    wget \
+    fontconfig \
+    gnupg \
+    "$JAVA_PACKAGE_DEBIAN"
+
+  if [[ "$INSTALL_GIT" == "true" ]]; then
+    as_root apt-get install -y git
+  fi
 
   as_root install -m 0755 -d /etc/apt/keyrings
-  local repo_base
-  if [[ "$JENKINS_REPO_CHANNEL" == "stable" ]]; then repo_base="debian-stable"; else repo_base="debian"; fi
 
-  curl -fsSL "https://pkg.jenkins.io/${repo_base}/jenkins.io-2026.key" \
+  local repo_base
+  if [[ "$JENKINS_REPO_CHANNEL" == "stable" ]]; then
+    repo_base="debian-stable"
+  else
+    repo_base="debian"
+  fi
+
+  log "Adding Jenkins APT repository"
+
+  curl -fsSL \
+    "https://pkg.jenkins.io/${repo_base}/jenkins.io-2026.key" \
     | as_root tee /etc/apt/keyrings/jenkins-keyring.asc >/dev/null
-  echo "deb [signed-by=/etc/apt/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/${repo_base} binary/" \
+
+  echo \
+    "deb [signed-by=/etc/apt/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/${repo_base} binary/" \
     | as_root tee /etc/apt/sources.list.d/jenkins.list >/dev/null
-  as_root apt-get update
+
+  # Refresh metadata after repository change
+  as_root rm -rf /var/lib/apt/lists/*
+  as_root mkdir -p /var/lib/apt/lists/partial
+
+  apt_update
+
+  log "Installing Jenkins"
   as_root apt-get install -y jenkins
+}
+
+install_rhel_family() {
+  local pm
+
+  if command -v dnf >/dev/null 2>&1; then
+    pm="dnf"
+  else
+    pm="yum"
+  fi
+
+  log "Installing base dependencies"
+  as_root "$pm" -y install \
+    ca-certificates \
+    curl \
+    wget \
+    fontconfig \
+    "$JAVA_PACKAGE_RHEL"
+
+  if [[ "$INSTALL_GIT" == "true" ]]; then
+    as_root "$pm" -y install git
+  fi
+
+  local repo_base
+  if [[ "$JENKINS_REPO_CHANNEL" == "stable" ]]; then
+    repo_base="redhat-stable"
+  else
+    repo_base="redhat"
+  fi
+
+  log "Adding Jenkins RPM repository"
+
+  as_root wget -q -O /etc/yum.repos.d/jenkins.repo \
+    "https://pkg.jenkins.io/${repo_base}/jenkins.repo"
+
+  as_root rpm --import \
+    "https://pkg.jenkins.io/${repo_base}/jenkins.io-2023.key"
+
+  log "Installing Jenkins"
+  as_root "$pm" -y install jenkins
 }
 
 install_jenkins() {
   if command -v apt-get >/dev/null 2>&1; then
     log "Detected Debian/Ubuntu family"
     install_debian_family
+
   elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
     log "Detected RHEL/Amazon Linux family"
     install_rhel_family
+
   else
     fail "Unsupported package manager. Supported: apt, dnf, yum"
   fi
 }
 
-main() {
-  require_command curl
-  install_jenkins
+start_jenkins() {
+  log "Starting Jenkins"
 
   as_root systemctl daemon-reload
-  as_root systemctl enable --now jenkins
+  as_root systemctl enable jenkins
+
+  if ! as_root systemctl restart jenkins; then
+    log "Jenkins failed to start"
+
+    echo "=== systemctl status jenkins ==="
+    as_root systemctl status jenkins --no-pager || true
+
+    echo "=== journalctl -u jenkins ==="
+    as_root journalctl -u jenkins --no-pager -n 150 || true
+
+    echo "=== Java version ==="
+    java -version || true
+
+    fail "Jenkins service failed to start"
+  fi
+
   wait_for_jenkins "$JENKINS_URL"
+}
 
-  if [[ "$RUN_INITIAL_SETUP" == true ]]; then
-    as_root env \
-      JENKINS_URL="$JENKINS_URL" \
-      JENKINS_ADMIN_USER="${JENKINS_ADMIN_USER:-admin}" \
-      JENKINS_ADMIN_PASSWORD="${JENKINS_ADMIN_PASSWORD:-}" \
-      JENKINS_ADMIN_FULLNAME="${JENKINS_ADMIN_FULLNAME:-Jenkins Administrator}" \
-      JENKINS_ADMIN_EMAIL="${JENKINS_ADMIN_EMAIL:-admin@example.invalid}" \
-      "${SCRIPT_DIR}/jenkins_unlock.sh"
+run_initial_setup() {
+  log "Running initial Jenkins setup"
+
+  as_root env \
+    JENKINS_URL="$JENKINS_URL" \
+    JENKINS_ADMIN_USER="${JENKINS_ADMIN_USER:-admin}" \
+    JENKINS_ADMIN_PASSWORD="${JENKINS_ADMIN_PASSWORD:-}" \
+    JENKINS_ADMIN_FULLNAME="${JENKINS_ADMIN_FULLNAME:-Jenkins Administrator}" \
+    JENKINS_ADMIN_EMAIL="${JENKINS_ADMIN_EMAIL:-admin@example.invalid}" \
+    "${SCRIPT_DIR}/jenkins_unlock.sh"
+}
+
+install_plugins() {
+  log "Installing Jenkins plugins"
+
+  as_root env \
+    JENKINS_URL="$JENKINS_URL" \
+    JENKINS_ADMIN_USER="${JENKINS_ADMIN_USER:-admin}" \
+    JENKINS_ADMIN_PASSWORD="${JENKINS_ADMIN_PASSWORD:-}" \
+    JENKINS_PLUGIN_FILE="${JENKINS_PLUGIN_FILE:-${SCRIPT_DIR}/plugins.txt}" \
+    "${SCRIPT_DIR}/jenkins_plugins.sh"
+
+  log "Restarting Jenkins after plugin installation"
+
+  if ! as_root systemctl restart jenkins; then
+    as_root systemctl status jenkins --no-pager || true
+    as_root journalctl -u jenkins --no-pager -n 150 || true
+    fail "Jenkins failed to restart after plugin installation"
   fi
 
-  if [[ "$INSTALL_PLUGINS" == true ]]; then
-    as_root env \
-      JENKINS_URL="$JENKINS_URL" \
-      JENKINS_ADMIN_USER="${JENKINS_ADMIN_USER:-admin}" \
-      JENKINS_ADMIN_PASSWORD="${JENKINS_ADMIN_PASSWORD:-}" \
-      JENKINS_PLUGIN_FILE="${JENKINS_PLUGIN_FILE:-${SCRIPT_DIR}/plugins.txt}" \
-      "${SCRIPT_DIR}/jenkins_plugins.sh"
+  wait_for_jenkins "$JENKINS_URL"
+}
 
-    as_root systemctl restart jenkins
-    wait_for_jenkins "$JENKINS_URL"
+configure_root_url() {
+  log "Configuring Jenkins root URL"
+
+  as_root env \
+    JENKINS_URL="$JENKINS_URL" \
+    JENKINS_ROOT_URL="${JENKINS_ROOT_URL:-$JENKINS_URL}" \
+    JENKINS_ADMIN_USER="${JENKINS_ADMIN_USER:-admin}" \
+    JENKINS_ADMIN_PASSWORD="${JENKINS_ADMIN_PASSWORD:-}" \
+    "${SCRIPT_DIR}/jenkins_confirm_url.sh"
+}
+
+main() {
+  require_command curl
+
+  install_jenkins
+  start_jenkins
+
+  if [[ "$RUN_INITIAL_SETUP" == "true" ]]; then
+    run_initial_setup
   fi
 
-  if [[ "$CONFIGURE_ROOT_URL" == true ]]; then
-    as_root env \
-      JENKINS_URL="$JENKINS_URL" \
-      JENKINS_ROOT_URL="${JENKINS_ROOT_URL:-$JENKINS_URL}" \
-      JENKINS_ADMIN_USER="${JENKINS_ADMIN_USER:-admin}" \
-      JENKINS_ADMIN_PASSWORD="${JENKINS_ADMIN_PASSWORD:-}" \
-      "${SCRIPT_DIR}/jenkins_confirm_url.sh"
+  if [[ "$INSTALL_PLUGINS" == "true" ]]; then
+    install_plugins
+  fi
+
+  if [[ "$CONFIGURE_ROOT_URL" == "true" ]]; then
+    configure_root_url
   fi
 
   log "Jenkins base setup completed"
 }
 
 main "$@"
+```
